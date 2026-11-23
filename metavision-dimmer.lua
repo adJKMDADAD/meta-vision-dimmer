@@ -122,7 +122,9 @@ function MD.Scan()
                 end
             end
             if wanted then
+                local fresh = MD.Tracked[child] == nil
                 MD.Tracked[child] = MD.Tracked[child] or { instances = {}, builtAt = 0 }
+                if fresh then MD.CastAt = tick() end
                 MD.Active = true
                 MD.ActiveUntil = math.max(MD.ActiveUntil, tick() + CONFIG.EffectMs / 1000)
             end
@@ -225,10 +227,15 @@ function MD.ClampLighting(wash, dark)
     local keep = 1 - math.clamp(wash, 0, 1)
 
     -- The effect's own loop writes Ambient / ExposureCompensation after every
-    -- render step callback, so lighting writes are best effort only. The
-    -- reliable part is MD.LiftCC below, which sits on top of the finished image.
+    -- render step callback, so a sampled exposure inside this pass still reads
+    -- the pre-tween value (it looks like there is no dip at all), while the
+    -- frame the player sees is already darkened. Drive the lift from the cast
+    -- clock instead: the effect opens at -1 and ramps back over 1 second.
     local observed = Lighting.ExposureCompensation
     local drop = math.max(0, MD.Base.Exposure - observed)
+    local phase = math.clamp((tick() - (MD.CastAt or 0)) / 1.1, 0, 1)
+    local clockDrop = 1.15 * (1 - phase)
+    local liftAmount = math.clamp(math.max(drop, clockDrop) * lift * 0.42, 0, 0.55)
 
     pcall(function()
         Lighting.Ambient = Lighting.Ambient:Lerp(MD.Base.Ambient, 1 - keep)
@@ -250,7 +257,7 @@ function MD.ClampLighting(wash, dark)
     pcall(function()
         local c = MD.LiftCC
         c.Enabled = true
-        c.Brightness = math.clamp(drop * lift * 0.42, 0, 0.55)
+        c.Brightness = liftAmount
         c.Contrast = 0
         c.Saturation = -0.04
         c.TintColor = Color3.fromRGB(255, 255, 255)
@@ -285,6 +292,7 @@ function MD.Hook()
         local wrapped = function(...)
             MD.Hits = MD.Hits + 1
             MD.Active = true
+            MD.CastAt = tick()
             MD.ActiveUntil = tick() + CONFIG.EffectMs / 1000
             local res = table.pack(original(...))
             -- peterTingle builds its own RenderStepped connection inside the
@@ -703,9 +711,10 @@ function MD.Report()
         CONFIG.VfxCut, CONFIG.Puzzles, CONFIG.Beam, CONFIG.Wash, CONFIG.Lift, tostring(CONFIG.BothIsagi)))
     if MD.Base then
         local drop = math.max(0, MD.Base.Exposure - Lighting.ExposureCompensation)
-        log(string.format("baseline exposure %.2f, now %.2f (dip %.2f), lift adds %.2f",
-            MD.Base.Exposure, Lighting.ExposureCompensation, drop,
-            math.clamp(drop * (CONFIG.Lift / 100) * 0.42, 0, 0.55)))
+        local phase = math.clamp((tick() - (MD.CastAt or 0)) / 1.1, 0, 1)
+        log(string.format("baseline exposure %.2f, sampled %.2f (dip %.2f), cast phase %.2f, lift %.2f",
+            MD.Base.Exposure, Lighting.ExposureCompensation, drop, phase,
+            math.clamp(math.max(drop, 1.15 * (1 - phase)) * (CONFIG.Lift / 100) * 0.42, 0, 0.55)))
     end
 end
 
