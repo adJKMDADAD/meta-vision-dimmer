@@ -225,12 +225,14 @@ function MD.ClampLighting(wash, dark)
     local keep = 1 - math.clamp(wash, 0, 1)
 
     -- The effect's own loop writes Ambient / ExposureCompensation after every
-    -- render step callback, so these writes are best effort only. The reliable
-    -- part is MD.LiftCC below, which sits on top of the finished image.
+    -- render step callback, so lighting writes are best effort only. The
+    -- reliable part is MD.LiftCC below, which sits on top of the finished image.
+    local observed = Lighting.ExposureCompensation
+    local drop = math.max(0, MD.Base.Exposure - observed)
+
     pcall(function()
         Lighting.Ambient = Lighting.Ambient:Lerp(MD.Base.Ambient, 1 - keep)
         Lighting.OutdoorAmbient = Lighting.OutdoorAmbient:Lerp(MD.Base.OutdoorAmbient, 1 - keep)
-        Lighting.ExposureCompensation = math.max(Lighting.ExposureCompensation, MD.Base.Exposure - 0.2)
     end)
 
     if not MD.LiftCC then
@@ -247,9 +249,8 @@ function MD.ClampLighting(wash, dark)
     -- the same amount. Nothing here ever makes the frame darker.
     pcall(function()
         local c = MD.LiftCC
-        local drop = math.max(0, MD.Base.Exposure - Lighting.ExposureCompensation)
         c.Enabled = true
-        c.Brightness = math.clamp(drop * (lift / 100) * 0.42, 0, 0.55)
+        c.Brightness = math.clamp(drop * lift * 0.42, 0, 0.55)
         c.Contrast = 0
         c.Saturation = -0.04
         c.TintColor = Color3.fromRGB(255, 255, 255)
@@ -702,7 +703,7 @@ function MD.Report()
         CONFIG.VfxCut, CONFIG.Puzzles, CONFIG.Beam, CONFIG.Wash, CONFIG.Lift, tostring(CONFIG.BothIsagi)))
     if MD.Base then
         local drop = math.max(0, MD.Base.Exposure - Lighting.ExposureCompensation)
-        log(string.format("baseline exposure %.2f, now %.2f (dip %.2f), lift cancels %.2f",
+        log(string.format("baseline exposure %.2f, now %.2f (dip %.2f), lift adds %.2f",
             MD.Base.Exposure, Lighting.ExposureCompensation, drop,
             math.clamp(drop * (CONFIG.Lift / 100) * 0.42, 0, 0.55)))
     end
