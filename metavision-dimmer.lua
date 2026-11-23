@@ -372,23 +372,23 @@ function MD.Pass()
 end
 
 function MD.StartLoop()
-    -- A plain RenderStepped connection runs in registration order, so the tween
-    -- loop that Nel's effect starts afterwards wrote its values in the same
-    -- frame and undid the dimming. BindToRenderStep at Camera+100 always runs
-    -- after every RenderStepped connection, so our value is the last one the
-    -- renderer sees.
-    local priority = 300
-    if Enum and Enum.RenderPriority and Enum.RenderPriority.Camera then
-        priority = Enum.RenderPriority.Camera.Value + 100
+    -- A named BindToRenderStep binding is scoped to this executor script and
+    -- survives a reload of the same file, so a stale unloaded instance can keep
+    -- the name and the fresh one never runs. A plain connection is owned by the
+    -- instance that made it and always fires. Ordering is no longer needed: the
+    -- levers used here (emitter rate/lifetime, beam width, part transparency,
+    -- and the ColorCorrection) are not written by the effect, so nothing has to
+    -- win a race.
+    if MD.RenderConn then
+        pcall(function() MD.RenderConn:Disconnect() end)
+        MD.RenderConn = nil
     end
-    MD.Priority = priority
-    pcall(function() RunService:UnbindFromRenderStep("MVD_Pass") end)
-    RunService:BindToRenderStep("MVD_Pass", priority, function()
+    MD.RenderConn = RunService.RenderStepped:Connect(function()
         if MD.Unloaded then return end
         local ok, err = pcall(MD.Pass)
         if not ok then log("pass error: " .. tostring(err)) end
     end)
-    MD.RenderConn = true
+    MD.Priority = "renderstepped"
 end
 
 -- ==================================================================== gui ==
@@ -743,6 +743,9 @@ function MD.Unload()
         if type(MD.RenderConn) == "RBXScriptConnection" then MD.RenderConn:Disconnect() end
     end)
     MD.RenderConn = nil
+    pcall(function()
+        if MD.LiftCC then MD.LiftCC.Enabled = false end
+    end)
     pcall(function() if MD.Gui then MD.Gui:Destroy() end end)
     MD.Gui, MD.Panel = nil, nil
     if _G.MetaDim == MD then _G.MetaDim = nil end

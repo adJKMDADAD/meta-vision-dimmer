@@ -10,8 +10,10 @@ the glare: particle emitters are zeroed (`Rate = 0`, `Lifetime = 0`,
 added on top of the image so the brightness drop survives the effect's own
 per-frame lighting writes.
 
-Panel: DIMMER / VFX CUT / PUZZLES / BEAM / WASH / DARK / BOTH ISAGI / UNLOAD.
-Console API: `_G.MetaDim.Report()`, `_G.MetaDim.Set(vfx, beam, wash, dark, puzzles)`,
+Panel: DIMMER / VFX CUT / PUZZLES / BEAM / WASH / LIFT / BOTH ISAGI / UNLOAD.
+No control ever darkens the frame: Metavision opens at exposure -1, and LIFT
+cancels that dip with a ColorCorrection instead of deepening it.
+Console API: `_G.MetaDim.Report()`, `_G.MetaDim.Set(vfx, beam, wash, lift, puzzles)`,
 `_G.MetaDim.Unload()`.
 
 ## Loader
