@@ -1,8 +1,7 @@
 -- loader for metavision-dimmer.lua
--- paste this one line into the executor, it pulls the latest file
+-- paste this one line into the executor, it always pulls the latest version
 
-loadstring(game:HttpGet("https://files.catbox.moe/e4hmki.lua"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/oooooolalal/azure-latch-scripts/main/metavision-dimmer.lua"))()
 
--- once the script lives in a github repo, swap the url for the raw one and
--- this file keeps working:
---   loadstring(game:HttpGet("https://raw.githubusercontent.com/USER/REPO/main/metavision-dimmer.lua"))()
+-- fallback host (used before the repo existed):
+--   loadstring(game:HttpGet("https://files.catbox.moe/e4hmki.lua"))()

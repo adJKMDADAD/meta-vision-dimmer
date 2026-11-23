@@ -17,13 +17,13 @@ Console API: `_G.MetaDim.Report()`, `_G.MetaDim.Set(vfx, beam, wash, dark, puzzl
 ## Loader
 
 ```lua
-loadstring(game:HttpGet("https://files.catbox.moe/e4hmki.lua"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/oooooolalal/azure-latch-scripts/main/metavision-dimmer.lua"))()
 ```
 
-Or straight from this repo once it is pushed:
+Fallback host used before the repo existed:
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/USER/REPO/main/metavision-dimmer.lua"))()
+loadstring(game:HttpGet("https://files.catbox.moe/e4hmki.lua"))()
 ```
 
 ## Updating
