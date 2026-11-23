@@ -222,9 +222,10 @@ end
 
 -- =============================================================== lighting ==
 
-function MD.ClampLighting(wash, dark)
+function MD.ClampLighting(wash, lift)
     if not MD.Base then return end
     local keep = 1 - math.clamp(wash, 0, 1)
+    lift = math.clamp(lift or 0, 0, 1)
 
     -- The effect's own loop writes Ambient / ExposureCompensation after every
     -- render step callback, so a sampled exposure inside this pass still reads
