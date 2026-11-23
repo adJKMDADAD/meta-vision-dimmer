@@ -17,7 +17,7 @@ Console API: `_G.MetaDim.Report()`, `_G.MetaDim.Set(vfx, beam, wash, dark, puzzl
 ## Loader
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/oooooolalal/azure-latch-scripts/main/metavision-dimmer.lua"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/adJKMDADAD/meta-vision-dimmer/main/metavision-dimmer.lua"))()
 ```
 
 Fallback host used before the repo existed:
