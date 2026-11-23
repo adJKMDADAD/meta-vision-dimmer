@@ -13,7 +13,8 @@
       - beams are kept but faded, so the ball path is still visible (BEAM)
       - Lighting.Ambient / OutdoorAmbient are pulled back toward the values
         the game had before the cast instead of the full blue wash (WASH)
-      - ExposureCompensation is pulled down from the pre-cast value (DARK)
+      - the exposure dip the effect opens with is cancelled, never deepened
+        (LIFT), so the screen does not go dark
       - Bloom / ColorCorrection / SunRays / DepthOfField are clamped while
         the effect is up
       - Highlights are never touched, so anything the special reveals stays
@@ -32,7 +33,7 @@
       PUZZLES     how transparent Design.Puzzles becomes (100 = invisible)
       BEAM        how visible the ball path beam stays (0 = gone)
       WASH        how much of the blue lighting wash is removed
-      DARK        how far exposure is pulled below the pre-cast value
+      LIFT        how much of the exposure dip is cancelled (100 = fully flat)
       BOTH ISAGI  also tame Rin's isagimetavision container if it shows up
       UNLOAD      restore hooks, restore lighting, remove the panel
 
@@ -53,7 +54,7 @@ local CONFIG = {
     Puzzles   = 95,    -- puzzle transparency: 0 untouched, 100 invisible
     Beam      = 25,    -- percent of beam visibility kept (ball path)
     Wash      = 85,    -- percent of the blue lighting wash removed
-    Dark      = 25,    -- percent of exposure pulled below baseline
+    Lift      = 70,    -- percent of the effect's exposure dip cancelled
     BothIsagi = true,  -- also tame Rin's metavision container
     Debug     = true,
     EffectMs  = 6000,  -- how long the pass keeps enforcing after a cast
@@ -225,36 +226,44 @@ function MD.ClampLighting(wash, dark)
 
     -- The effect's own loop writes Ambient / ExposureCompensation after every
     -- render step callback, so these writes are best effort only. The reliable
-    -- part is MD.DimCC below, which sits on top of the finished image.
+    -- part is MD.LiftCC below, which sits on top of the finished image.
     pcall(function()
         Lighting.Ambient = Lighting.Ambient:Lerp(MD.Base.Ambient, 1 - keep)
         Lighting.OutdoorAmbient = Lighting.OutdoorAmbient:Lerp(MD.Base.OutdoorAmbient, 1 - keep)
-        Lighting.ExposureCompensation = MD.Base.Exposure - (dark * 1.2)
+        Lighting.ExposureCompensation = math.max(Lighting.ExposureCompensation, MD.Base.Exposure - 0.2)
     end)
 
-    if not MD.DimCC then
+    if not MD.LiftCC then
         local cc = Instance.new("ColorCorrectionEffect")
-        cc.Name = "MVD_Dim"
+        cc.Name = "MVD_Lift"
         cc.Parent = Lighting
-        MD.DimCC = cc
+        MD.LiftCC = cc
     end
+
+    -- Metavision starts at ExposureCompensation -1 and ramps back over a second,
+    -- which reads as the screen dipping dark. Exposure writes are overwritten by
+    -- the effect, so cancel that dip with a ColorCorrection instead: read how far
+    -- the exposure currently sits below the pre-cast value and lift the image by
+    -- the same amount. Nothing here ever makes the frame darker.
     pcall(function()
-        local c = MD.DimCC
+        local c = MD.LiftCC
+        local drop = math.max(0, MD.Base.Exposure - Lighting.ExposureCompensation)
         c.Enabled = true
-        c.Brightness = -(dark * 0.55) - (wash * 0.06)
-        c.Contrast = 0.04 + wash * 0.06
-        c.Saturation = -0.05
-        c.TintColor = Color3.fromRGB(255, 252, 246)
+        c.Brightness = math.clamp(drop * (lift / 100) * 0.42, 0, 0.55)
+        c.Contrast = 0
+        c.Saturation = -0.04
+        c.TintColor = Color3.fromRGB(255, 255, 255)
     end)
 
     for _, child in ipairs(Lighting:GetChildren()) do
         pcall(function()
             if child:IsA("BloomEffect") then
-                child.Intensity = math.min(child.Intensity, 0.25 + (1 - wash) * 0.35)
-            elseif child:IsA("ColorCorrectionEffect") and child ~= MD.DimCC then
-                child.Brightness = math.min(child.Brightness, 0.0)
-                child.Contrast = math.min(child.Contrast, 0.12)
-                child.Saturation = math.min(child.Saturation, 0.0)
+                child.Intensity = math.min(child.Intensity, 0.18 + (1 - wash) * 0.3)
+            elseif child:IsA("ColorCorrectionEffect") and child ~= MD.LiftCC then
+                -- other scripts' correction may be the one darkening the screen;
+                -- only ever raise brightness, never lower it
+                if child.Brightness < 0 then child.Brightness = 0 end
+                if child.Contrast > 0.12 then child.Contrast = 0.12 end
             elseif child:IsA("SunRaysEffect") then
                 child.Intensity = math.min(child.Intensity, 0.06)
             elseif child:IsA("DepthOfFieldEffect") then
@@ -335,17 +344,17 @@ function MD.Pass()
     end
 
     if anyContainer or now < MD.ActiveUntil then
-        MD.ClampLighting(CONFIG.Wash / 100, CONFIG.Dark / 100)
+        MD.ClampLighting(CONFIG.Wash / 100, CONFIG.Lift / 100)
         MD.Active = true
     elseif MD.Active then
         MD.Active = false
         MD.RestoreLighting()
         pcall(function()
-            if MD.DimCC then
-                MD.DimCC.Brightness = 0
-                MD.DimCC.Contrast = 0
-                MD.DimCC.Saturation = 0
-                MD.DimCC.Enabled = false
+            if MD.LiftCC then
+                MD.LiftCC.Brightness = 0
+                MD.LiftCC.Contrast = 0
+                MD.LiftCC.Saturation = 0
+                MD.LiftCC.Enabled = false
             end
         end)
         dbg("effect over - lighting restored, dim filter off")
@@ -628,9 +637,9 @@ function MD.BuildGui()
         MD.MakeSlider(body, 120, "WASH", 0, 100,
             function() return CONFIG.Wash end,
             function(v) CONFIG.Wash = v end)
-        MD.MakeSlider(body, 150, "DARK", 0, 100,
-            function() return CONFIG.Dark end,
-            function(v) CONFIG.Dark = v end)
+        MD.MakeSlider(body, 150, "LIFT", 0, 100,
+            function() return CONFIG.Lift end,
+            function(v) CONFIG.Lift = v end)
         MD.MakeToggle(body, 180, "BOTH ISAGI (RIN)",
             function() return CONFIG.BothIsagi end,
             function(v) CONFIG.BothIsagi = v end)
@@ -689,19 +698,21 @@ function MD.Report()
     for _ in pairs(MD.Tracked) do n = n + 1 end
     log(string.format("enabled=%s active=%s casts=%d live_containers=%d",
         tostring(CONFIG.Enabled), tostring(MD.Active), MD.Hits, n))
-    log(string.format("vfx cut=%d%% puzzles=%d%% beam=%d%% wash=%d%% dark=%d%% both=%s",
-        CONFIG.VfxCut, CONFIG.Puzzles, CONFIG.Beam, CONFIG.Wash, CONFIG.Dark, tostring(CONFIG.BothIsagi)))
+    log(string.format("vfx cut=%d%% puzzles=%d%% beam=%d%% wash=%d%% lift=%d%% both=%s",
+        CONFIG.VfxCut, CONFIG.Puzzles, CONFIG.Beam, CONFIG.Wash, CONFIG.Lift, tostring(CONFIG.BothIsagi)))
     if MD.Base then
-        log(string.format("baseline exposure %.2f, target while active %.2f",
-            MD.Base.Exposure, MD.Base.Exposure - CONFIG.Dark / 100 * 1.2))
+        local drop = math.max(0, MD.Base.Exposure - Lighting.ExposureCompensation)
+        log(string.format("baseline exposure %.2f, now %.2f (dip %.2f), lift cancels %.2f",
+            MD.Base.Exposure, Lighting.ExposureCompensation, drop,
+            math.clamp(drop * (CONFIG.Lift / 100) * 0.42, 0, 0.55)))
     end
 end
 
-function MD.Set(vfx, beam, wash, dark, puzzles)
+function MD.Set(vfx, beam, wash, lift, puzzles)
     if vfx then CONFIG.VfxCut = math.clamp(vfx, 0, 100) end
     if beam then CONFIG.Beam = math.clamp(beam, 0, 100) end
     if wash then CONFIG.Wash = math.clamp(wash, 0, 100) end
-    if dark then CONFIG.Dark = math.clamp(dark, 0, 100) end
+    if lift then CONFIG.Lift = math.clamp(lift, 0, 100) end
     if puzzles then CONFIG.Puzzles = math.clamp(puzzles, 0, 100) end
     MD.PaintSliders()
     MD.Report()
@@ -713,9 +724,9 @@ function MD.Unload()
     pcall(MD.Unhook)
     pcall(MD.RestoreLighting)
     pcall(function()
-        if MD.DimCC then MD.DimCC:Destroy() end
+        if MD.LiftCC then MD.LiftCC:Destroy() end
     end)
-    MD.DimCC = nil
+    MD.LiftCC = nil
     pcall(function() RunService:UnbindFromRenderStep("MVD_Pass") end)
     pcall(function()
         if type(MD.RenderConn) == "RBXScriptConnection" then MD.RenderConn:Disconnect() end
@@ -738,5 +749,5 @@ MD.BuildGui()
 MD.Hook()
 MD.StartLoop()
 
-log("ready - VFX CUT 85, PUZZLES 95, BEAM 25, WASH 85, DARK 25")
+log("ready - VFX CUT 85, PUZZLES 95, BEAM 25, WASH 85, LIFT 70")
 log("cast Nel T, then _G.MetaDim.Report() shows state; UNLOAD in the panel")
