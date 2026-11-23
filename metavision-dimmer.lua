@@ -1,0 +1,742 @@
+--[[ METAVISION DIMMER - Azure Latch (Nel Isagi)
+
+    Nel's T special, Metavision, clones a grid model into workspace.Effects
+    under the name "SUPER METAVISION" and then lerps Lighting toward a blue
+    wash. That model is mostly glare: 21 ParticleEmitters, 20 neon Piece3
+    parts and 2 Beams. This script keeps the ball path readable and removes
+    the blinding part.
+
+    WHAT IT DOES
+      - ParticleEmitters inside the Metavision model are switched off
+      - every light inside it (PointLight / SpotLight / SurfaceLight) is off
+      - neon piece parts are pushed toward high transparency
+      - beams are kept but faded, so the ball path is still visible (BEAM)
+      - Lighting.Ambient / OutdoorAmbient are pulled back toward the values
+        the game had before the cast instead of the full blue wash (WASH)
+      - ExposureCompensation is pulled down from the pre-cast value (DARK)
+      - Bloom / ColorCorrection / SunRays / DepthOfField are clamped while
+        the effect is up
+      - Highlights are never touched, so anything the special reveals stays
+        visible
+
+    HOW IT HOOKS
+      nelisagiVFX.peterTingle is the function that builds the effect. It is
+      also reachable as replication.peterTingle, because the client merges its
+      VFX modules into that table. The hook only marks the effect active; all
+      dimming happens in one RenderStepped pass afterwards, so it does not
+      fight the game's own tween frame by frame until it has to.
+
+    CONTROLS
+      DIMMER      master on/off, off restores lighting immediately
+      VFX CUT     puzzles / particles / lights / glow removed, 0 keeps the effect
+      PUZZLES     how transparent Design.Puzzles becomes (100 = invisible)
+      BEAM        how visible the ball path beam stays (0 = gone)
+      WASH        how much of the blue lighting wash is removed
+      DARK        how far exposure is pulled below the pre-cast value
+      BOTH ISAGI  also tame Rin's isagimetavision container if it shows up
+      UNLOAD      restore hooks, restore lighting, remove the panel
+
+    Console: _G.MetaDim.Report()  _G.MetaDim.Set(vfx, beam, wash, dark, puzzles)
+             _G.MetaDim.Unload()
+]]--
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService  = game:GetService("UserInputService")
+local Lighting          = game:GetService("Lighting")
+local LocalPlayer       = Players.LocalPlayer
+
+local CONFIG = {
+    Enabled   = true,
+    VfxCut    = 85,    -- percent of particles / lights / glow removed
+    Puzzles   = 95,    -- puzzle transparency: 0 untouched, 100 invisible
+    Beam      = 25,    -- percent of beam visibility kept (ball path)
+    Wash      = 85,    -- percent of the blue lighting wash removed
+    Dark      = 25,    -- percent of exposure pulled below baseline
+    BothIsagi = true,  -- also tame Rin's metavision container
+    Debug     = true,
+    EffectMs  = 6000,  -- how long the pass keeps enforcing after a cast
+}
+
+local MD = {
+    Unloaded = false,
+    Active = false,
+    ActiveUntil = 0,
+    Tracked = {},
+    Hooks = {},
+    RenderConn = nil,
+    Gui = nil, Panel = nil,
+    Sliders = {}, Toggles = {},
+    Collapsed = false,
+    Hits = 0,
+    Base = nil,
+}
+
+local function log(t) print("[MVD] " .. tostring(t)) end
+local function dbg(t) if CONFIG.Debug then print("[MVD][dbg] " .. tostring(t)) end end
+
+function MD.CaptureBase()
+    if MD.Base then return end
+    MD.Base = {
+        Ambient = Lighting.Ambient,
+        OutdoorAmbient = Lighting.OutdoorAmbient,
+        Exposure = Lighting.ExposureCompensation,
+        ClockTime = Lighting.ClockTime,
+    }
+    dbg(string.format("baseline exposure %.2f", MD.Base.Exposure))
+end
+
+function MD.RestoreLighting()
+    if not MD.Base then return end
+    pcall(function()
+        Lighting.Ambient = MD.Base.Ambient
+        Lighting.OutdoorAmbient = MD.Base.OutdoorAmbient
+        Lighting.ExposureCompensation = MD.Base.Exposure
+    end)
+end
+
+-- ============================================================= containers ==
+
+local function isMetaName(name)
+    local n = string.lower(tostring(name))
+    if string.find(n, "metavision", 1, true) then return true end
+    if string.find(n, "super senses", 1, true) then return true end
+    return false
+end
+
+function MD.Scan()
+    local fx = workspace:FindFirstChild("Effects")
+    local char = LocalPlayer.Character
+    local buckets = { workspace }
+    if fx then table.insert(buckets, fx) end
+    if char then table.insert(buckets, char) end
+
+    for _, bucket in ipairs(buckets) do
+        for _, child in ipairs(bucket:GetChildren()) do
+            local wanted = isMetaName(child.Name)
+            if wanted and not CONFIG.BothIsagi then
+                if not string.find(string.lower(child.Name), "metavision", 1, true) then
+                    wanted = false
+                end
+            end
+            if wanted then
+                MD.Tracked[child] = MD.Tracked[child] or { instances = {}, builtAt = 0 }
+                MD.Active = true
+                MD.ActiveUntil = math.max(MD.ActiveUntil, tick() + CONFIG.EffectMs / 1000)
+            end
+        end
+    end
+end
+
+function MD.Refresh(container)
+    local rec = MD.Tracked[container]
+    if not rec then return nil end
+    local now = tick()
+    if rec.builtAt and (now - rec.builtAt) < 1 and #rec.instances > 0 then
+        return rec.instances
+    end
+    rec.builtAt = now
+    rec.instances = container:GetDescendants()
+    return rec.instances
+end
+
+-- true when the object lives inside Design.Puzzles or is one of the puzzle
+-- pieces. Nel's own render loop fades these to 0.5 .. 1 every frame, so they
+-- are the part of the effect that stays bright the longest.
+local function isPuzzle(obj)
+    local n = string.lower(obj.Name)
+    if string.find(n, "piece", 1, true) then return true end
+    local node = obj
+    for _ = 1, 4 do
+        node = node.Parent
+        if not node then return false end
+        local p = string.lower(node.Name)
+        if string.find(p, "puzzle", 1, true) or string.find(p, "piece", 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+function MD.Tame(instances, cut, beamKeep, puzzleAlpha)
+    if not instances then return end
+    local kill = cut >= 0.5
+    local partAlpha = 0.60 + (0.85 - 0.60) * cut      -- 0.60 untouched -> 0.85 at full cut
+    local beamAlpha = math.clamp(1 - beamKeep, 0, 1)  -- beamKeep 1 -> invisible
+    puzzleAlpha = math.clamp(puzzleAlpha or 0, 0, 1)   -- 1 -> fully invisible
+
+    -- Nel's effect forces ParticleEmitter.Enabled back to true every frame, so
+    -- Enabled is useless as a switch. Rate, Lifetime, Transparency and beam
+    -- width are not touched by the game and do hold.
+    MD.Orig = MD.Orig or setmetatable({}, { __mode = "k" })
+
+    for _, obj in ipairs(instances) do
+        if obj.Parent ~= nil then
+            local puzzle = false
+            pcall(function() puzzle = isPuzzle(obj) end)
+            pcall(function()
+                if obj:IsA("ParticleEmitter") then
+                    obj.Enabled = false
+                    local hidden = puzzle and puzzleAlpha or cut
+                    if kill then
+                        obj.Rate = 0
+                        obj.Lifetime = NumberRange.new(0)
+                        obj.Transparency = NumberSequence.new(1)
+                    else
+                        obj.Transparency = NumberSequence.new(math.clamp(hidden, 0, 1))
+                    end
+                elseif obj:IsA("Beam") or obj:IsA("Trail") then
+                    local orig = MD.Orig[obj]
+                    if not orig then
+                        orig = { w0 = obj.Width0, w1 = obj.Width1 }
+                        MD.Orig[obj] = orig
+                    end
+                    local keepBeam = puzzle and (1 - puzzleAlpha) or (1 - beamAlpha)
+                    obj.Width0 = orig.w0 * keepBeam
+                    obj.Width1 = orig.w1 * keepBeam
+                    if kill then obj.Enabled = false end
+                elseif obj:IsA("PointLight") or obj:IsA("SpotLight") or obj:IsA("SurfaceLight") then
+                    if kill then
+                        obj.Enabled = false
+                        obj.Brightness = 0
+                    end
+                elseif obj:IsA("ForceField") then
+                    if kill then obj.Visible = false end
+                elseif obj:IsA("BasePart") then
+                    local target = partAlpha
+                    if puzzle and puzzleAlpha > target then target = puzzleAlpha end
+                    if obj.Transparency < target then
+                        obj.Transparency = target
+                    end
+                end
+                -- Highlights and everything else are left alone on purpose:
+                -- they are what the special actually reveals
+            end)
+        end
+    end
+end
+
+-- =============================================================== lighting ==
+
+function MD.ClampLighting(wash, dark)
+    if not MD.Base then return end
+    local keep = 1 - math.clamp(wash, 0, 1)
+
+    -- The effect's own loop writes Ambient / ExposureCompensation after every
+    -- render step callback, so these writes are best effort only. The reliable
+    -- part is MD.DimCC below, which sits on top of the finished image.
+    pcall(function()
+        Lighting.Ambient = Lighting.Ambient:Lerp(MD.Base.Ambient, 1 - keep)
+        Lighting.OutdoorAmbient = Lighting.OutdoorAmbient:Lerp(MD.Base.OutdoorAmbient, 1 - keep)
+        Lighting.ExposureCompensation = MD.Base.Exposure - (dark * 1.2)
+    end)
+
+    if not MD.DimCC then
+        local cc = Instance.new("ColorCorrectionEffect")
+        cc.Name = "MVD_Dim"
+        cc.Parent = Lighting
+        MD.DimCC = cc
+    end
+    pcall(function()
+        local c = MD.DimCC
+        c.Enabled = true
+        c.Brightness = -(dark * 0.55) - (wash * 0.06)
+        c.Contrast = 0.04 + wash * 0.06
+        c.Saturation = -0.05
+        c.TintColor = Color3.fromRGB(255, 252, 246)
+    end)
+
+    for _, child in ipairs(Lighting:GetChildren()) do
+        pcall(function()
+            if child:IsA("BloomEffect") then
+                child.Intensity = math.min(child.Intensity, 0.25 + (1 - wash) * 0.35)
+            elseif child:IsA("ColorCorrectionEffect") and child ~= MD.DimCC then
+                child.Brightness = math.min(child.Brightness, 0.0)
+                child.Contrast = math.min(child.Contrast, 0.12)
+                child.Saturation = math.min(child.Saturation, 0.0)
+            elseif child:IsA("SunRaysEffect") then
+                child.Intensity = math.min(child.Intensity, 0.06)
+            elseif child:IsA("DepthOfFieldEffect") then
+                child.FarIntensity = math.min(child.FarIntensity, 0.15)
+            end
+        end)
+    end
+end
+
+-- ================================================================== hooks ==
+
+function MD.Hook()
+    local hooked = 0
+    local function wrap(tableRef, key)
+        if type(tableRef) ~= "table" or type(tableRef[key]) ~= "function" then return end
+        local original = tableRef[key]
+        MD.Hooks[#MD.Hooks + 1] = { table = tableRef, key = key, original = original }
+        local wrapped = function(...)
+            MD.Hits = MD.Hits + 1
+            MD.Active = true
+            MD.ActiveUntil = tick() + CONFIG.EffectMs / 1000
+            local res = table.pack(original(...))
+            -- peterTingle builds its own RenderStepped connection inside the
+            -- call, so reconnecting ours afterwards guarantees the dimming
+            -- pass runs after the game's tween instead of before it
+            pcall(MD.StartLoop)
+            return table.unpack(res, 1, res.n)
+        end
+        if newcclosure then
+            local okc, cc = pcall(newcclosure, wrapped)
+            tableRef[key] = (okc and type(cc) == "function") and cc or wrapped
+        else
+            tableRef[key] = wrapped
+        end
+        hooked = hooked + 1
+    end
+
+    local ok, nel = pcall(function()
+        return require(ReplicatedStorage.client.replication.otherReplication.nelisagiVFX)
+    end)
+    if ok then wrap(nel, "peterTingle") end
+
+    local ok2, rep = pcall(function() return require(ReplicatedStorage.client.replication) end)
+    if ok2 and rep ~= nel then wrap(rep, "peterTingle") end
+
+    if hooked > 0 then
+        log(string.format("hooked peterTingle (%d reference%s)", hooked, hooked == 1 and "" or "s"))
+    else
+        log("peterTingle not found - running as a live scan only")
+    end
+    return hooked > 0
+end
+
+function MD.Unhook()
+    for _, h in ipairs(MD.Hooks) do
+        pcall(function() h.table[h.key] = h.original end)
+    end
+    MD.Hooks = {}
+end
+
+-- =================================================================== loop ==
+
+function MD.Pass()
+    if MD.Unloaded or not CONFIG.Enabled then return end
+
+    MD.Scan()
+
+    local now = tick()
+    local anyContainer = false
+    for container in pairs(MD.Tracked) do
+        if container.Parent == nil then
+            MD.Tracked[container] = nil
+        else
+            anyContainer = true
+            MD.Tame(MD.Refresh(container), CONFIG.VfxCut / 100, CONFIG.Beam / 100,
+                CONFIG.Puzzles / 100)
+        end
+    end
+
+    if anyContainer or now < MD.ActiveUntil then
+        MD.ClampLighting(CONFIG.Wash / 100, CONFIG.Dark / 100)
+        MD.Active = true
+    elseif MD.Active then
+        MD.Active = false
+        MD.RestoreLighting()
+        pcall(function()
+            if MD.DimCC then
+                MD.DimCC.Brightness = 0
+                MD.DimCC.Contrast = 0
+                MD.DimCC.Saturation = 0
+                MD.DimCC.Enabled = false
+            end
+        end)
+        dbg("effect over - lighting restored, dim filter off")
+    end
+end
+
+function MD.StartLoop()
+    -- A plain RenderStepped connection runs in registration order, so the tween
+    -- loop that Nel's effect starts afterwards wrote its values in the same
+    -- frame and undid the dimming. BindToRenderStep at Camera+100 always runs
+    -- after every RenderStepped connection, so our value is the last one the
+    -- renderer sees.
+    local priority = 300
+    if Enum and Enum.RenderPriority and Enum.RenderPriority.Camera then
+        priority = Enum.RenderPriority.Camera.Value + 100
+    end
+    MD.Priority = priority
+    pcall(function() RunService:UnbindFromRenderStep("MVD_Pass") end)
+    RunService:BindToRenderStep("MVD_Pass", priority, function()
+        if MD.Unloaded then return end
+        local ok, err = pcall(MD.Pass)
+        if not ok then log("pass error: " .. tostring(err)) end
+    end)
+    MD.RenderConn = true
+end
+
+-- ==================================================================== gui ==
+
+local C_BG    = Color3.fromRGB(10, 11, 16)
+local C_ROW   = Color3.fromRGB(22, 24, 32)
+local C_TRACK = Color3.fromRGB(34, 37, 48)
+local C_TEXT  = Color3.fromRGB(232, 234, 242)
+local C_FILL  = Color3.fromRGB(120, 170, 255)
+local C_BTN   = Color3.fromRGB(38, 40, 52)
+local C_ON    = Color3.fromRGB(40, 110, 70)
+local C_GREEN = Color3.fromRGB(120, 255, 150)
+local C_OFF   = Color3.fromRGB(120, 45, 50)
+
+local function corner(p, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r or 4)
+    c.Parent = p
+end
+
+function MD.MakeSlider(parent, y, text, lo, hi, getv, setv)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -12, 0, 26)
+    row.Position = UDim2.new(0, 6, 0, y)
+    row.BackgroundColor3 = C_ROW
+    row.BorderSizePixel = 0
+    row.Parent = parent
+    corner(row, 4)
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0, 96, 1, 0)
+    label.Position = UDim2.new(0, 8, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Font = Enum.Font.Code
+    label.TextSize = 11
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextColor3 = C_TEXT
+    label.Text = text
+    label.Parent = row
+
+    local track = Instance.new("Frame")
+    track.Size = UDim2.new(0, 104, 0, 6)
+    track.Position = UDim2.new(0, 108, 0.5, -3)
+    track.BackgroundColor3 = C_TRACK
+    track.BorderSizePixel = 0
+    track.Parent = row
+    corner(track, 3)
+
+    local fill = Instance.new("Frame")
+    fill.Size = UDim2.new(0, 0, 1, 0)
+    fill.BackgroundColor3 = C_FILL
+    fill.BorderSizePixel = 0
+    fill.Parent = track
+    corner(fill, 3)
+
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.new(0, 8, 1, 8)
+    knob.Position = UDim2.new(0, 0, 0, -4)
+    knob.BackgroundColor3 = Color3.fromRGB(240, 240, 250)
+    knob.BorderSizePixel = 0
+    knob.ZIndex = 3
+    knob.Parent = track
+    corner(knob, 4)
+
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.new(0, 46, 0, 18)
+    box.Position = UDim2.new(1, -54, 0.5, -9)
+    box.BackgroundColor3 = Color3.fromRGB(32, 32, 42)
+    box.BorderSizePixel = 0
+    box.Font = Enum.Font.Code
+    box.TextSize = 11
+    box.TextColor3 = C_TEXT
+    box.ClearTextOnFocus = false
+    box.TextXAlignment = Enum.TextXAlignment.Center
+    box.Text = tostring(math.floor(getv()))
+    box.Parent = row
+    corner(box, 3)
+
+    local def = { get = getv, set = setv, fill = fill, knob = knob, box = box,
+                  min = lo, max = hi }
+
+    function def.paint()
+        local v = def.get()
+        local frac = 0
+        if def.max > def.min then frac = (v - def.min) / (def.max - def.min) end
+        frac = math.clamp(frac, 0, 1)
+        fill.Size = UDim2.new(frac, 0, 1, 0)
+        knob.Position = UDim2.new(frac, -4, 0, -4)
+        box.Text = tostring(math.floor(v))
+    end
+
+    local dragging = false
+    local function apply(x)
+        local w = track.AbsoluteSize.X
+        if w <= 0 then return end
+        local frac = math.clamp((x - track.AbsolutePosition.X) / w, 0, 1)
+        def.set(math.floor(def.min + frac * (def.max - def.min) + 0.5))
+        def.paint()
+    end
+
+    local function down(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            apply(input.Position.X)
+        end
+    end
+
+    track.InputBegan:Connect(down)
+    knob.InputBegan:Connect(down)
+    row.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then apply(i.Position.X) end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
+            or i.UserInputType == Enum.UserInputType.Touch) then
+            apply(i.Position.X)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+            or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+    box.FocusLost:Connect(function()
+        local n = tonumber(box.Text)
+        if not n then def.paint() return end
+        def.set(math.clamp(math.floor(n), def.min, def.max))
+        def.paint()
+    end)
+
+    def.paint()
+    table.insert(MD.Sliders, def)
+end
+
+function MD.MakeToggle(parent, y, text, getv, setv)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -12, 0, 26)
+    row.Position = UDim2.new(0, 6, 0, y)
+    row.BackgroundColor3 = C_ROW
+    row.BorderSizePixel = 0
+    row.Parent = parent
+    corner(row, 4)
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0, 170, 1, 0)
+    label.Position = UDim2.new(0, 8, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Font = Enum.Font.Code
+    label.TextSize = 11
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextColor3 = C_TEXT
+    label.Text = text
+    label.Parent = row
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, 54, 0, 18)
+    btn.Position = UDim2.new(1, -62, 0.5, -9)
+    btn.BackgroundColor3 = C_BTN
+    btn.BorderSizePixel = 0
+    btn.Font = Enum.Font.Code
+    btn.TextSize = 11
+    btn.TextColor3 = C_TEXT
+    btn.Text = "OFF"
+    btn.Parent = row
+    corner(btn, 4)
+
+    local def = { get = getv, set = setv }
+    function def.paint()
+        local on = def.get() and true or false
+        btn.Text = on and "ON" or "OFF"
+        btn.BackgroundColor3 = on and C_ON or C_BTN
+        btn.TextColor3 = on and C_GREEN or C_TEXT
+    end
+    btn.MouseButton1Click:Connect(function()
+        def.set(not def.get())
+        def.paint()
+    end)
+    def.paint()
+    table.insert(MD.Toggles, def)
+end
+
+function MD.PaintSliders()
+    for i = 1, #MD.Sliders do pcall(MD.Sliders[i].paint) end
+    for i = 1, #MD.Toggles do pcall(MD.Toggles[i].paint) end
+end
+
+function MD.BuildGui()
+    if MD.Gui then return end
+    pcall(function()
+        local HEIGHT = 274
+        local sg = Instance.new("ScreenGui")
+        sg.Name = "MetaVisionDimmer"
+        sg.ResetOnSpawn = false
+        sg.DisplayOrder = 2147482400
+        local placed = false
+        if gethui then pcall(function() sg.Parent = gethui() placed = true end) end
+        if not placed then
+            sg.Parent = LocalPlayer:FindFirstChild("PlayerGui") or game:GetService("CoreGui")
+        end
+
+        local panel = Instance.new("Frame")
+        panel.Size = UDim2.new(0, 268, 0, HEIGHT)
+        panel.Position = UDim2.new(0, 14, 0, 430)
+        panel.BackgroundColor3 = C_BG
+        panel.BackgroundTransparency = 0.1
+        panel.BorderSizePixel = 0
+        panel.Active = true
+        panel.Parent = sg
+        corner(panel, 6)
+
+        local title = Instance.new("TextLabel")
+        title.Size = UDim2.new(1, -78, 0, 22)
+        title.Position = UDim2.new(0, 8, 0, 2)
+        title.BackgroundTransparency = 1
+        title.Font = Enum.Font.Code
+        title.TextSize = 12
+        title.TextXAlignment = Enum.TextXAlignment.Left
+        title.TextColor3 = C_TEXT
+        title.Text = "NEL T - METAVISION DIMMER"
+        title.Parent = panel
+
+        local hide = Instance.new("TextButton")
+        hide.Size = UDim2.new(0, 46, 0, 18)
+        hide.Position = UDim2.new(1, -52, 0, 4)
+        hide.BackgroundColor3 = C_BTN
+        hide.BorderSizePixel = 0
+        hide.Font = Enum.Font.Code
+        hide.TextSize = 10
+        hide.TextColor3 = C_TEXT
+        hide.Text = "HIDE"
+        hide.Parent = panel
+        corner(hide, 4)
+
+        local body = Instance.new("Frame")
+        body.Size = UDim2.new(1, 0, 1, -26)
+        body.Position = UDim2.new(0, 0, 0, 26)
+        body.BackgroundTransparency = 1
+        body.Parent = panel
+
+        MD.MakeToggle(body, 0, "DIMMER", function() return CONFIG.Enabled end,
+            function(v)
+                CONFIG.Enabled = v
+                if not v then MD.RestoreLighting() end
+            end)
+        MD.MakeSlider(body, 30, "VFX CUT", 0, 100,
+            function() return CONFIG.VfxCut end,
+            function(v) CONFIG.VfxCut = v end)
+        MD.MakeSlider(body, 60, "PUZZLES", 0, 100,
+            function() return CONFIG.Puzzles end,
+            function(v) CONFIG.Puzzles = v end)
+        MD.MakeSlider(body, 90, "BEAM", 0, 100,
+            function() return CONFIG.Beam end,
+            function(v) CONFIG.Beam = v end)
+        MD.MakeSlider(body, 120, "WASH", 0, 100,
+            function() return CONFIG.Wash end,
+            function(v) CONFIG.Wash = v end)
+        MD.MakeSlider(body, 150, "DARK", 0, 100,
+            function() return CONFIG.Dark end,
+            function(v) CONFIG.Dark = v end)
+        MD.MakeToggle(body, 180, "BOTH ISAGI (RIN)",
+            function() return CONFIG.BothIsagi end,
+            function(v) CONFIG.BothIsagi = v end)
+
+        local unload = Instance.new("TextButton")
+        unload.Size = UDim2.new(1, -12, 0, 24)
+        unload.Position = UDim2.new(0, 6, 0, 212)
+        unload.BackgroundColor3 = C_OFF
+        unload.BorderSizePixel = 0
+        unload.Font = Enum.Font.Code
+        unload.TextSize = 11
+        unload.TextColor3 = Color3.fromRGB(255, 235, 235)
+        unload.Text = "UNLOAD"
+        unload.Parent = body
+        corner(unload, 4)
+        unload.MouseButton1Click:Connect(function() MD.Unload() end)
+
+        hide.MouseButton1Click:Connect(function()
+            MD.Collapsed = not MD.Collapsed
+            body.Visible = not MD.Collapsed
+            panel.Size = UDim2.new(0, 268, 0, MD.Collapsed and 26 or HEIGHT)
+            hide.Text = MD.Collapsed and "SHOW" or "HIDE"
+        end)
+
+        local dragging, startPos, basePos = false, nil, nil
+        title.InputBegan:Connect(function(i)
+            if i.UserInputType == Enum.UserInputType.MouseButton1
+                or i.UserInputType == Enum.UserInputType.Touch then
+                dragging, startPos, basePos = true, i.Position, panel.Position
+            end
+        end)
+        UserInputService.InputChanged:Connect(function(i)
+            if not dragging then return end
+            if i.UserInputType == Enum.UserInputType.MouseMovement
+                or i.UserInputType == Enum.UserInputType.Touch then
+                local d = i.Position - startPos
+                panel.Position = UDim2.new(basePos.X.Scale, basePos.X.Offset + d.X,
+                                           basePos.Y.Scale, basePos.Y.Offset + d.Y)
+            end
+        end)
+        UserInputService.InputEnded:Connect(function(i)
+            if i.UserInputType == Enum.UserInputType.MouseButton1
+                or i.UserInputType == Enum.UserInputType.Touch then
+                dragging = false
+            end
+        end)
+
+        MD.Gui, MD.Panel = sg, panel
+    end)
+end
+
+-- ================================================================== public =
+
+function MD.Report()
+    local n = 0
+    for _ in pairs(MD.Tracked) do n = n + 1 end
+    log(string.format("enabled=%s active=%s casts=%d live_containers=%d",
+        tostring(CONFIG.Enabled), tostring(MD.Active), MD.Hits, n))
+    log(string.format("vfx cut=%d%% puzzles=%d%% beam=%d%% wash=%d%% dark=%d%% both=%s",
+        CONFIG.VfxCut, CONFIG.Puzzles, CONFIG.Beam, CONFIG.Wash, CONFIG.Dark, tostring(CONFIG.BothIsagi)))
+    if MD.Base then
+        log(string.format("baseline exposure %.2f, target while active %.2f",
+            MD.Base.Exposure, MD.Base.Exposure - CONFIG.Dark / 100 * 1.2))
+    end
+end
+
+function MD.Set(vfx, beam, wash, dark, puzzles)
+    if vfx then CONFIG.VfxCut = math.clamp(vfx, 0, 100) end
+    if beam then CONFIG.Beam = math.clamp(beam, 0, 100) end
+    if wash then CONFIG.Wash = math.clamp(wash, 0, 100) end
+    if dark then CONFIG.Dark = math.clamp(dark, 0, 100) end
+    if puzzles then CONFIG.Puzzles = math.clamp(puzzles, 0, 100) end
+    MD.PaintSliders()
+    MD.Report()
+end
+
+function MD.Unload()
+    if MD.Unloaded then return end
+    MD.Unloaded = true
+    pcall(MD.Unhook)
+    pcall(MD.RestoreLighting)
+    pcall(function()
+        if MD.DimCC then MD.DimCC:Destroy() end
+    end)
+    MD.DimCC = nil
+    pcall(function() RunService:UnbindFromRenderStep("MVD_Pass") end)
+    pcall(function()
+        if type(MD.RenderConn) == "RBXScriptConnection" then MD.RenderConn:Disconnect() end
+    end)
+    MD.RenderConn = nil
+    pcall(function() if MD.Gui then MD.Gui:Destroy() end end)
+    MD.Gui, MD.Panel = nil, nil
+    if _G.MetaDim == MD then _G.MetaDim = nil end
+    print("[MVD] unloaded - hooks restored, lighting restored, panel removed")
+end
+
+-- ================================================================= startup =
+
+_G.MetaDim = MD
+MD.Config = CONFIG
+MD.CONFIG = CONFIG
+
+MD.CaptureBase()
+MD.BuildGui()
+MD.Hook()
+MD.StartLoop()
+
+log("ready - VFX CUT 85, PUZZLES 95, BEAM 25, WASH 85, DARK 25")
+log("cast Nel T, then _G.MetaDim.Report() shows state; UNLOAD in the panel")
