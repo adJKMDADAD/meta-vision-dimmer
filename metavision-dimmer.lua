@@ -312,7 +312,7 @@ function MD.ClampLighting(wash, lift)
             elseif child:IsA("ColorCorrectionEffect") and child ~= MD.LiftCC then
                 -- flashes add their own correction at Brightness 0.5 or higher;
                 -- only ever cap the bright ones, never darken anything
-                if child.Brightness > 0.2 then child.Brightness = 0.2 end
+                if child.Brightness > 0.06 then child.Brightness = 0.06 end
                 if child.Contrast > 0.12 then child.Contrast = 0.12 end
             elseif child:IsA("BlurEffect") then
                 if child.Size > 8 then child.Size = 8 end
