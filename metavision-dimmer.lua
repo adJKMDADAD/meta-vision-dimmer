@@ -56,6 +56,7 @@ local CONFIG = {
     Wash      = 85,    -- percent of the blue lighting wash removed
     Lift      = 70,    -- percent of the effect's exposure dip cancelled
     BothIsagi = true,  -- also tame Rin's metavision container
+    NoFlash   = true,  -- use the game's own epilepsysafe setting: no ultFlash
     Debug     = true,
     EffectMs  = 6000,  -- how long the pass keeps enforcing after a cast
 }
@@ -95,6 +96,33 @@ function MD.RestoreLighting()
         Lighting.OutdoorAmbient = MD.Base.OutdoorAmbient
         Lighting.ExposureCompensation = MD.Base.Exposure
     end)
+end
+
+-- The blinding part of the cast is not the model, it is ultFlash:
+--   ultFlash(0.5, 1, nil, Color3.new(0, 0, 1))
+-- which clones a ColorCorrection with Brightness 0.5 and a full screen
+-- BlurEffect, then fades them over a second. The game skips all of that when
+-- LocalPlayer.setting.epilepsysafe is true, so switch that on instead of trying
+-- to fight the flash after it starts.
+function MD.ApplyNoFlash(on)
+    local player = LocalPlayer
+    if not player then return end
+    local folder = player:FindFirstChild("setting")
+    if not folder then return end
+
+    local flag = folder:FindFirstChild("epilepsysafe")
+    if on then
+        if not flag then
+            flag = Instance.new("BoolValue")
+            flag.Name = "epilepsysafe"
+            flag.Parent = folder
+        end
+        if MD.NoFlashOrig == nil then MD.NoFlashOrig = flag.Value end
+        flag.Value = true
+    else
+        if flag and MD.NoFlashOrig ~= nil then flag.Value = MD.NoFlashOrig end
+        MD.NoFlashOrig = nil
+    end
 end
 
 -- ============================================================= containers ==
@@ -172,21 +200,35 @@ function MD.Tame(instances, cut, beamKeep, puzzleAlpha)
     -- Nel's effect forces ParticleEmitter.Enabled back to true every frame, so
     -- Enabled is useless as a switch. Rate, Lifetime, Transparency and beam
     -- width are not touched by the game and do hold.
+    --
+    -- Puzzle pieces are the exception: the effect rewrites their Transparency
+    -- every frame (0.6 -> 1 -> back), so writing Transparency from here every
+    -- frame fights it and the pieces visibly flicker. LocalTransparencyModifier
+    -- is client-only, is never written by the game, and multiplies on top of
+    -- Transparency, so the value holds and nothing alternates.
     MD.Orig = MD.Orig or setmetatable({}, { __mode = "k" })
 
+    local key = string.format("%.3f|%.3f|%.3f", cut, beamKeep, puzzleAlpha)
+    if MD.DoneKey ~= key then
+        MD.DoneKey = key
+        MD.Done = setmetatable({}, { __mode = "k" })
+    end
+    local done = MD.Done or setmetatable({}, { __mode = "k" })
+    MD.Done = done
+
     for _, obj in ipairs(instances) do
-        if obj.Parent ~= nil then
+        if obj.Parent ~= nil and not done[obj] then
             local puzzle = false
             pcall(function() puzzle = isPuzzle(obj) end)
-            pcall(function()
+            local ok = pcall(function()
                 if obj:IsA("ParticleEmitter") then
                     obj.Enabled = false
-                    local hidden = puzzle and puzzleAlpha or cut
                     if kill then
                         obj.Rate = 0
                         obj.Lifetime = NumberRange.new(0)
                         obj.Transparency = NumberSequence.new(1)
                     else
+                        local hidden = puzzle and puzzleAlpha or cut
                         obj.Transparency = NumberSequence.new(math.clamp(hidden, 0, 1))
                     end
                 elseif obj:IsA("Beam") or obj:IsA("Trail") then
@@ -209,13 +251,12 @@ function MD.Tame(instances, cut, beamKeep, puzzleAlpha)
                 elseif obj:IsA("BasePart") then
                     local target = partAlpha
                     if puzzle and puzzleAlpha > target then target = puzzleAlpha end
-                    if obj.Transparency < target then
-                        obj.Transparency = target
-                    end
+                    obj.LocalTransparencyModifier = target
                 end
                 -- Highlights and everything else are left alone on purpose:
                 -- they are what the special actually reveals
             end)
+            if ok then done[obj] = true end
         end
     end
 end
@@ -269,10 +310,12 @@ function MD.ClampLighting(wash, lift)
             if child:IsA("BloomEffect") then
                 child.Intensity = math.min(child.Intensity, 0.18 + (1 - wash) * 0.3)
             elseif child:IsA("ColorCorrectionEffect") and child ~= MD.LiftCC then
-                -- other scripts' correction may be the one darkening the screen;
-                -- only ever raise brightness, never lower it
-                if child.Brightness < 0 then child.Brightness = 0 end
+                -- flashes add their own correction at Brightness 0.5 or higher;
+                -- only ever cap the bright ones, never darken anything
+                if child.Brightness > 0.2 then child.Brightness = 0.2 end
                 if child.Contrast > 0.12 then child.Contrast = 0.12 end
+            elseif child:IsA("BlurEffect") then
+                if child.Size > 8 then child.Size = 8 end
             elseif child:IsA("SunRaysEffect") then
                 child.Intensity = math.min(child.Intensity, 0.06)
             elseif child:IsA("DepthOfFieldEffect") then
@@ -296,6 +339,9 @@ function MD.Hook()
             MD.CastAt = tick()
             MD.ActiveUntil = tick() + CONFIG.EffectMs / 1000
             local res = table.pack(original(...))
+            -- tame in the same frame the effect is built, before it is ever
+            -- rendered, so the opening flash cannot show at full strength
+            pcall(MD.Pass)
             -- peterTingle builds its own RenderStepped connection inside the
             -- call, so reconnecting ours afterwards guarantees the dimming
             -- pass runs after the game's tween instead of before it
@@ -580,7 +626,7 @@ end
 function MD.BuildGui()
     if MD.Gui then return end
     pcall(function()
-        local HEIGHT = 274
+        local HEIGHT = 304
         local sg = Instance.new("ScreenGui")
         sg.Name = "MetaVisionDimmer"
         sg.ResetOnSpawn = false
@@ -653,10 +699,16 @@ function MD.BuildGui()
         MD.MakeToggle(body, 180, "BOTH ISAGI (RIN)",
             function() return CONFIG.BothIsagi end,
             function(v) CONFIG.BothIsagi = v end)
+        MD.MakeToggle(body, 210, "NO FLASH (GAME SETTING)",
+            function() return CONFIG.NoFlash end,
+            function(v)
+                CONFIG.NoFlash = v
+                MD.ApplyNoFlash(v)
+            end)
 
         local unload = Instance.new("TextButton")
         unload.Size = UDim2.new(1, -12, 0, 24)
-        unload.Position = UDim2.new(0, 6, 0, 212)
+        unload.Position = UDim2.new(0, 6, 0, 242)
         unload.BackgroundColor3 = C_OFF
         unload.BorderSizePixel = 0
         unload.Font = Enum.Font.Code
@@ -734,6 +786,7 @@ function MD.Unload()
     MD.Unloaded = true
     pcall(MD.Unhook)
     pcall(MD.RestoreLighting)
+    pcall(MD.ApplyNoFlash, false)
     pcall(function()
         if MD.LiftCC then MD.LiftCC:Destroy() end
     end)
@@ -762,6 +815,7 @@ MD.CaptureBase()
 MD.BuildGui()
 MD.Hook()
 MD.StartLoop()
+if CONFIG.NoFlash then MD.ApplyNoFlash(true) end
 
-log("ready - VFX CUT 85, PUZZLES 95, BEAM 25, WASH 85, LIFT 70")
+log("ready - VFX CUT 85, PUZZLES 95, BEAM 25, WASH 85, LIFT 70, NO FLASH on")
 log("cast Nel T, then _G.MetaDim.Report() shows state; UNLOAD in the panel")
